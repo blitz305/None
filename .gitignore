@@ -1,5 +1,5 @@
 __pycache__
-.ipynb_checkpoints/ 
+.ipynb_checkpoints/
 checkpoint/
 wandb/
 core.*
@@ -7,4 +7,5 @@ nohup.out
 *_dataset/
 *_datasets/
 .idea/
-/data/
+data
+.venv
