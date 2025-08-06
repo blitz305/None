@@ -1,6 +1,7 @@
 
 import inspect 
 import logging 
+from mem2n import MemN2N
 
 import torch
 import torch.nn as nn 
@@ -162,11 +163,22 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
         self.alpha = alpha 
         self.num_triples = num_triples
         self.word_embeddings = self.shared
+        self.vocab_size = len(tokenizer)
+        self.hidden_size = config.d_model
+        self.memory_size = 20
+        self.sentence_size = 64#新增改动
 
         self.relation_extraction = TripleRelationExtraction(self.model_dim, self.ent_dim, self.ent_dim, k=self.k)
         self.gnn = TripleGraphNeuralNet(ent_dim=self.ent_dim, rel_dim=self.ent_dim, hidden_dim=256, hop=self.hop)
 
         self.init_weights()
+        self.memn2n = MemN2N(
+            vocab_size=self.vocab_size,
+            embedding_size=self.hidden_size,
+            memory_size=self.memory_size,
+            sentence_size=self.sentence_size,
+            hops=3
+        )#新增改动
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -352,54 +364,57 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
         }
 
     def forward(
-        self, 
-        input_ids=None, 
-        attention_mask=None, 
-        decoder_input_ids=None, 
-        decoder_attention_mask=None, 
-        encoder_outputs=None, 
+        self,
+        input_ids=None,
+        attention_mask=None,
+        decoder_input_ids=None,
+        decoder_attention_mask=None,
+        encoder_outputs=None,
         question_indices=None,
         question_mask=None,
         ent_indices=None,
-        ent_mask=None, 
-        entity_text=None, 
-        entity_adj=None, 
+        ent_mask=None,
+        entity_text=None,
+        entity_adj=None,
         entity_adj_mask=None,
-        entity_adj_relation=None, 
-        labels=None, 
-        entity_adj_relevant_relation_label=None, 
+        entity_adj_relation=None,
+        labels=None,
+        entity_adj_relevant_relation_label=None,
         ent_is_ans_label=None,
-        mask_passages=False, 
-        num_passages_after_mask=None, 
-        passage_entity_ids=None, 
+        mask_passages=False,
+        num_passages_after_mask=None,
+        passage_entity_ids=None,
         passage_entity_mask=None,
-        output_attentions=False, 
+        output_attentions=False,
         output_hidden_states=False,
         return_dict=False,
+        memory_input_ids=None,#改动
         **kwargs
     ):
-        
+
         calculate_kg_loss = kwargs.get("calculate_kg_loss", False)
         calculate_ans_loss = kwargs.get("calculate_ans_loss", labels is not None)
 
         if encoder_outputs is None:
+            mem_output = self.memn2n(memory_input_ids) # 改动
             encoder_outputs = self.get_encoder_output(
-                input_ids = input_ids, 
-                attention_mask = attention_mask, 
-                question_indices=question_indices, 
+                mem_output=mem_output,
+                input_ids = input_ids,
+                attention_mask = attention_mask,
+                question_indices=question_indices,
                 question_mask=question_mask,
-                ent_indices=ent_indices, 
-                ent_mask=ent_mask, 
-                entity_text = entity_text, 
-                entity_adj=entity_adj, 
-                entity_adj_mask=entity_adj_mask, 
-                entity_adj_relation=entity_adj_relation, 
+                ent_indices=ent_indices,
+                ent_mask=ent_mask,
+                entity_text = entity_text,
+                entity_adj=entity_adj,
+                entity_adj_mask=entity_adj_mask,
+                entity_adj_relation=entity_adj_relation,
                 entity_adj_relevant_relation_label=entity_adj_relevant_relation_label,
-                mask_passages=mask_passages, 
-                num_passages_after_mask=num_passages_after_mask, 
-                passage_entity_ids=passage_entity_ids, 
+                mask_passages=mask_passages,
+                num_passages_after_mask=num_passages_after_mask,
+                passage_entity_ids=passage_entity_ids,
                 passage_entity_mask=passage_entity_mask,
-                output_attentions = output_attentions, 
+                output_attentions = output_attentions,
                 output_hidden_states = output_hidden_states,
                 **kwargs
             )
@@ -411,24 +426,24 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
         adj_relation_score = encoder_outputs["adj_relation_score"]
 
         if calculate_kg_loss:
-            
+
             ent_is_ans_label = ent_is_ans_label.to(entity_score.dtype).to(entity_score.device)
-            ent_is_ans_label[(ent_is_ans_label > 0.0) & (~node_mask)] = 0.0 
+            ent_is_ans_label[(ent_is_ans_label > 0.0) & (~node_mask)] = 0.0
             ent_loss_fct = nn.KLDivLoss(reduction='none')
             answer_len = torch.sum(ent_is_ans_label, dim=1, keepdim=True)
-            answer_len[answer_len == 0] = 1.0 
+            answer_len[answer_len == 0] = 1.0
             answer_prob = ent_is_ans_label.div(answer_len)
             log_ent_score = torch.log(F.softmax(entity_score, dim=1) + 1e-9).squeeze(-1)
-            ent_loss = ent_loss_fct(log_ent_score, answer_prob).sum(dim=1) 
-            has_ans_mask = torch.sum(ent_is_ans_label, dim=1) > 0 
+            ent_loss = ent_loss_fct(log_ent_score, answer_prob).sum(dim=1)
+            has_ans_mask = torch.sum(ent_is_ans_label, dim=1) > 0
             has_ans_num = torch.sum(has_ans_mask)
             if has_ans_num > 0:
                 ent_loss = torch.sum(ent_loss * has_ans_mask) / has_ans_num
             else:
                 ent_loss = torch.sum(ent_loss * has_ans_mask)
-            
+
             kg_loss = self.alpha * ent_loss
-            
+
             mask = entity_adj_mask & (torch.sum(entity_adj_relevant_relation_label, dim=(1, 2)) > 0)[:, None, None]
             filter_relation_score = adj_relation_score[mask]
             filter_relation_label = entity_adj_relevant_relation_label[mask]
@@ -443,14 +458,18 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
 
         if labels is not None:
             decoder_input_ids = self._shift_right(labels)
+        mem_output = mem_output.unsqueeze(1)  # [B, 1, H]
+        encoder_hidden_states = torch.cat([mem_output, question_ent_hidden_states], dim=1)
+        encoder_attention_mask = torch.cat(
+            [torch.ones((mem_output.size(0), 1), device=question_ent_mask.device), question_ent_mask], dim=1)
 
         decoder_output = self.decoder(
-            input_ids = decoder_input_ids, 
-            attention_mask = decoder_attention_mask, 
-            encoder_hidden_states = question_ent_hidden_states,
-            encoder_attention_mask = question_ent_mask, 
-            output_attentions = output_attentions, 
-            output_hidden_states = output_hidden_states, 
+            input_ids = decoder_input_ids,
+            attention_mask = decoder_attention_mask,
+            encoder_hidden_states=encoder_hidden_states,  # 改了这里
+            encoder_attention_mask=encoder_attention_mask,  # 改了这里
+            output_attentions = output_attentions,
+            output_hidden_states = output_hidden_states,
             return_dict = False,
         )
 
@@ -466,20 +485,20 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
             ans_loss = loss_fct(lm_logits.reshape(-1, lm_logits.shape[-1]), labels.reshape(-1))
         else:
             ans_loss = None
-        
+
         if not calculate_kg_loss and calculate_ans_loss:
             loss = ans_loss
 
         if calculate_kg_loss and calculate_ans_loss:
             loss = kg_loss + ans_loss
-        
+
         if not return_dict:
             output = (lm_logits, question_ent_hidden_states)
             output = ((loss, ) + output) if loss is not None else output
             return output
-        
+
         return Seq2SeqLMOutput(loss=loss, logits=lm_logits)
-    
+
     def _prepare_encoder_decoder_kwargs_for_generation(self, inputs_tensor: torch.Tensor, model_kwargs, model_input_name, *args, **kwargs):
 
         # 1. get encoder
@@ -506,6 +525,13 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
         encoder_kwargs["return_dict"] = True 
         encoder_kwargs[model_input_name] = inputs_tensor
         # model_kwargs["encoder_outputs"]: ModelOutput = encoder(**encoder_kwargs)
+        memory_input_ids = model_kwargs.get("memory_input_ids", None)
+        if memory_input_ids is not None:
+            mem_output = self.memn2n(memory_input_ids)
+            encoder_kwargs["mem_output"] = mem_output
+        else:
+            raise ValueError("memory_input_ids is required for MemN2N integration.")
+
         model_kwargs["encoder_outputs"] = self.get_encoder_output(**encoder_kwargs)
 
         # dict_keys(['attention_mask', 'ent_indices', 'ent_mask', 'output_attentions', 'output_hidden_states', 'use_cache', 'encoder_outputs'])
