@@ -9,7 +9,7 @@ python main.py `
   --k 20 `
   --hop 3 `
   --n_context 10 `
-  --name default_experiment `
+  --name default_multi_turn_experiment `
   --checkpoint_dir checkpoint `
   --lr 1e-4 `
   --scheduler fixed `
@@ -19,4 +19,6 @@ python main.py `
   --clip 1.0 `
   --total_steps 15000 `
   --eval_freq 500 `
-  --save_freq 15000
+  --save_freq 15000 `
+  --memory_size 20 `
+  --sentence_size 64

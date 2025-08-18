@@ -47,8 +47,18 @@ def main():
 
         train_dataloader = get_dataloader(opt.local_rank, train_dataset, opt.per_gpu_batch_size, shuffle=True, collate_fn=collator)
         val_dataloader = get_dataloader(opt.local_rank, val_dataset, opt.per_gpu_batch_size, shuffle=False, collate_fn=collator)
-        
-    model = TripleKGFiDT5.from_pretrained(model_name, tokenizer=tokenizer, ent_dim=opt.ent_dim, k=opt.k, hop=opt.hop, alpha=opt.alpha, num_triples=opt.num_triples)
+
+    model = TripleKGFiDT5.from_pretrained(
+        model_name,
+        tokenizer=tokenizer,
+        ent_dim=opt.ent_dim,
+        k=opt.k,
+        hop=opt.hop,
+        alpha=opt.alpha,
+        num_triples=opt.num_triples,
+        memory_size=opt.memory_size,
+        sentence_size=opt.sentence_size
+    )
     model.resize_token_embeddings(len(tokenizer))
     relationid2name = pickle.load(open(opt.relationid2name, "rb"))
     relation_embedding = pickle.load(open(opt.init_relation_embedding, "rb"))

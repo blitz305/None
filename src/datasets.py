@@ -136,6 +136,12 @@ class TripleFiDDataset(Dataset):
                 if triple not in relevant_triples:
                     relevant_triples.append(triple)
 
+        history = example.get("history", [])
+        story_sentences = []
+        for turn in history:
+            story_sentences.append(f"question: {turn['q']} answer: {turn['a']}")
+
+            #新增改动
         return {
             'index' : index,
             'question' : question,
@@ -149,7 +155,8 @@ class TripleFiDDataset(Dataset):
             "triples": triples, 
             "relevant_triples": relevant_triples,
             "evidences": example.get("evidences", None), 
-            "question_entity": question_entity_list, 
+            "question_entity": question_entity_list,
+            'story_sentences': story_sentences,
         }
 
     def sort_data(self):
@@ -223,6 +230,9 @@ class FiDCollator(object):
         self.cls_token_id = self.tokenizer.encode("[CLS]")[0]
         self.ent_start_id = self.tokenizer.encode("<e>")[0]
         self.ent_end_id = self.tokenizer.encode("</e>")[0]
+        self.memory_size = 20
+        self.sentence_size = 64
+        self.question_prefix = 'question:'
 
     def __call__(self, batch):
 
@@ -355,11 +365,46 @@ class FiDCollator(object):
 
         batch_entity_is_answer_label = self.get_entity_is_answer_label(batch, batch_max_num_entities)
 
+        batch_stories_ids = []
+        batch_current_q_ids = []
+
+        for ex in batch:
+            # 编码当前问题 (给MemN2N的query输入)
+            original_question = ex['question'].replace(self.question_prefix, "").strip()
+            q_encoded = self.tokenizer(
+                original_question,
+                max_length=self.sentence_size,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            batch_current_q_ids.append(q_encoded['input_ids'])
+
+            # 编码对话历史 (给MemN2N的story输入)
+            stories = ex['story_sentences']
+            # 截断或填充到固定的 memory_size
+            if len(stories) > self.memory_size:
+                stories = stories[-self.memory_size:]
+            else:
+                stories = stories + [""] * (self.memory_size - len(stories))
+
+            s_encoded = self.tokenizer.batch_encode_plus(
+                stories,
+                max_length=self.sentence_size,
+                padding='max_length',
+                truncation=True,
+                return_tensors='pt'
+            )
+            batch_stories_ids.append(s_encoded['input_ids'].unsqueeze(0))
+
+        memory_stories_ids = torch.cat(batch_stories_ids, dim=0)
+        memory_question_ids = torch.cat(batch_current_q_ids, dim=0)
+
         return (index, target_ids, target_mask, passage_ids, passage_masks, batch_question_text, batch_question_indices, batch_question_mask, \
                 batch_entity_mention_indices, batch_entity_mention_mask, batch_entity_is_answer_label, batch_entity_text, \
                     batch_entity_adj, batch_entity_adj_mask, batch_entity_adj_relation, batch_entity_adj_relevant_relation_label, \
-                        batch_passage_entity_ids, batch_passage_entity_mask)
-    
+                        batch_passage_entity_ids, batch_passage_entity_mask,memory_stories_ids,memory_question_ids)
+
     def maybe_truncate_question(self, question, max_num_words=100):
         words = question.split()
         if len(words) > max_num_words:

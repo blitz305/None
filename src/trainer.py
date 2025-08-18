@@ -778,7 +778,7 @@ class ReaderTrainer(BaseTrainer):
         
         (idx, labels, _, context_ids, context_mask, question_text, question_indices, question_mask, \
             ent_indices, ent_mask, ent_is_ans, entity_text, entity_adj, entity_adj_mask, \
-                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask) = batch
+                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask,memory_stories_ids, memory_question_ids) = batch
         
         calculate_ans_loss = True
         calculate_kg_loss = True
@@ -799,7 +799,9 @@ class ReaderTrainer(BaseTrainer):
             ent_is_ans_label=ent_is_ans,
             calculate_ans_loss=calculate_ans_loss,
             calculate_kg_loss=calculate_kg_loss,
-            question_text=question_text, 
+            question_text=question_text,
+            memory_stories_ids=memory_stories_ids,
+            memory_question_ids=memory_question_ids,
         )[0]
 
         return train_loss
@@ -810,7 +812,7 @@ class ReaderTrainer(BaseTrainer):
 
         (idx, labels, _, context_ids, context_mask, question_text, question_indices, question_mask, \
             ent_indices, ent_mask, ent_is_ans, entity_text, entity_adj, entity_adj_mask, \
-                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask) = batch
+                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask, memory_stories_ids, memory_question_ids) = batch
         
         mask_passages = self.mask_passages
         num_passages_after_mask = self.num_passages_after_mask 
@@ -831,7 +833,9 @@ class ReaderTrainer(BaseTrainer):
             mask_passages = mask_passages, 
             num_passages_after_mask = num_passages_after_mask, 
             passage_entity_ids = passage_entity_ids, 
-            passage_entity_mask = passage_entity_mask
+            passage_entity_mask = passage_entity_mask,
+            memory_stories_ids=memory_stories_ids,
+            memory_question_ids=memory_question_ids
         )
 
         score_list = []
