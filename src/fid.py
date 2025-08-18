@@ -1,7 +1,8 @@
 
 import inspect 
 import logging 
-from mem2n import MemN2N
+# 在 src/fid.py 中
+from .mem2n import MemN2N
 
 import torch
 import torch.nn as nn 
@@ -152,7 +153,7 @@ class TripleGraphNeuralNet(nn.Module):
 
 class TripleKGFiDT5(T5ForConditionalGeneration):
 
-    def __init__(self, config: T5Config, tokenizer: AutoTokenizer=None, ent_dim: int=128, k: int = 5, hop: int = 2, alpha: int = 1.0, num_triples: int=20):
+    def __init__(self, config: T5Config, tokenizer: AutoTokenizer=None, ent_dim: int=128, k: int = 5, hop: int = 2, alpha: int = 1.0, num_triples: int=20, memory_size: int = 20, sentence_size: int = 64):
 
         super().__init__(config)
         
@@ -165,8 +166,8 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
         self.word_embeddings = self.shared
         self.vocab_size = len(tokenizer)
         self.hidden_size = config.d_model
-        self.memory_size = 20
-        self.sentence_size = 64#新增改动
+        self.memory_size = memory_size
+        self.sentence_size = sentence_size#改动
 
         self.relation_extraction = TripleRelationExtraction(self.model_dim, self.ent_dim, self.ent_dim, k=self.k)
         self.gnn = TripleGraphNeuralNet(ent_dim=self.ent_dim, rel_dim=self.ent_dim, hidden_dim=256, hop=self.hop)
@@ -177,8 +178,8 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
             embedding_size=self.hidden_size,
             memory_size=self.memory_size,
             sentence_size=self.sentence_size,
-            hops=3
-        )#新增改动
+            hops=3  # 可配置
+        )
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -388,24 +389,30 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
         output_attentions=False,
         output_hidden_states=False,
         return_dict=False,
-        memory_input_ids=None,#改动
+        memory_input_ids=None,
+        memory_stories_ids=None,
+        memory_question_ids=None,
+            #改动
         **kwargs
     ):
 
         calculate_kg_loss = kwargs.get("calculate_kg_loss", False)
         calculate_ans_loss = kwargs.get("calculate_ans_loss", labels is not None)
+        # 只有在提供了记忆输入时才进行计算
+        if memory_stories_ids is not None and memory_question_ids is not None:
+            mem_output = self.memn2n(memory_stories_ids, memory_question_ids)  # shape: [B, H]
+        else:
+            mem_output = None
 
         if encoder_outputs is None:
-            mem_output = self.memn2n(memory_input_ids) # 改动
             encoder_outputs = self.get_encoder_output(
-                mem_output=mem_output,
-                input_ids = input_ids,
-                attention_mask = attention_mask,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 question_indices=question_indices,
                 question_mask=question_mask,
                 ent_indices=ent_indices,
                 ent_mask=ent_mask,
-                entity_text = entity_text,
+                entity_text=entity_text,
                 entity_adj=entity_adj,
                 entity_adj_mask=entity_adj_mask,
                 entity_adj_relation=entity_adj_relation,
@@ -414,11 +421,10 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
                 num_passages_after_mask=num_passages_after_mask,
                 passage_entity_ids=passage_entity_ids,
                 passage_entity_mask=passage_entity_mask,
-                output_attentions = output_attentions,
-                output_hidden_states = output_hidden_states,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
                 **kwargs
             )
-
         question_ent_hidden_states = encoder_outputs["question_ent_hidden_states"]
         question_ent_mask = encoder_outputs["question_ent_mask"]
         node_mask = encoder_outputs["node_mask"]
@@ -458,21 +464,29 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
 
         if labels is not None:
             decoder_input_ids = self._shift_right(labels)
-        mem_output = mem_output.unsqueeze(1)  # [B, 1, H]
-        encoder_hidden_states = torch.cat([mem_output, question_ent_hidden_states], dim=1)
-        encoder_attention_mask = torch.cat(
-            [torch.ones((mem_output.size(0), 1), device=question_ent_mask.device), question_ent_mask], dim=1)
+
+            # --- BEGIN MODIFICATION: Step 3 - Fuse and feed to decoder ---
+        if mem_output is not None:
+            mem_output_expanded = mem_output.unsqueeze(1)  # [B, 1, H]
+            mem_attention_mask = torch.ones(mem_output_expanded.shape[:2], device=question_ent_mask.device,
+                                            dtype=torch.long)
+
+            final_encoder_hidden_states = torch.cat([mem_output_expanded, question_ent_hidden_states], dim=1)
+            final_encoder_attention_mask = torch.cat([mem_attention_mask, question_ent_mask], dim=1)
+        else:
+            # Fallback to original behavior if no memory is provided
+            final_encoder_hidden_states = question_ent_hidden_states
+            final_encoder_attention_mask = question_ent_mask
 
         decoder_output = self.decoder(
-            input_ids = decoder_input_ids,
-            attention_mask = decoder_attention_mask,
-            encoder_hidden_states=encoder_hidden_states,  # 改了这里
-            encoder_attention_mask=encoder_attention_mask,  # 改了这里
-            output_attentions = output_attentions,
-            output_hidden_states = output_hidden_states,
-            return_dict = False,
+            input_ids=decoder_input_ids,
+            attention_mask=decoder_attention_mask,
+            encoder_hidden_states=final_encoder_hidden_states,  # Use fused hidden states
+            encoder_attention_mask=final_encoder_attention_mask,  # Use fused attention mask
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=False,
         )
-
         sequence_output = decoder_output[0]
         if self.config.tie_word_embeddings:
             sequence_output = sequence_output * (self.model_dim**-0.5)
@@ -499,67 +513,86 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
 
         return Seq2SeqLMOutput(loss=loss, logits=lm_logits)
 
-    def _prepare_encoder_decoder_kwargs_for_generation(self, inputs_tensor: torch.Tensor, model_kwargs, model_input_name, *args, **kwargs):
+    def _prepare_encoder_decoder_kwargs_for_generation(self, inputs_tensor: torch.Tensor, model_kwargs,
+                                                       model_input_name):
+        # 步骤 1: 从 kwargs 中分离出记忆张量，避免它们被意外传递
+        memory_stories_ids = model_kwargs.pop("memory_stories_ids", None)
+        memory_question_ids = model_kwargs.pop("memory_question_ids", None)
 
-        # 1. get encoder
-        # encoder = self.get_encoder()
+        # 步骤 2: 独立地调用 get_encoder_output 来获取 REANO 的原始输出
+        # 这是“GNN车道”的处理过程，完全不知道记忆的存在
 
-        # 2. Prepare encoder args and encoder kwargs from model kwargs.
-        irrelevant_prefix = ["decoder_", "cross_attn", "use_cache"]
+        # 准备调用 get_encoder_output 所需的参数
+        irrelevant_prefix = ["decoder_", "cross_attn", "use_cache", "encoder_outputs"]
         encoder_kwargs = {
             argument: value
             for argument, value in model_kwargs.items()
             if not any(argument.startswith(p) for p in irrelevant_prefix)
         }
-        # encoder_signature = set(inspect.signature(encoder.forward).parameters)
-        encoder_signature = set(inspect.signature(self.get_encoder_output).parameters)
 
-        encoder_accepts_wildcard = "kwargs" in encoder_signature or "model_kwargs" in encoder_signature
-        if not encoder_accepts_wildcard:
-            encoder_kwargs = {
-                argument: value for argument, value in encoder_kwargs.items() if argument in encoder_signature
-            }
+        # 调用我们的自定义 encoder，获取 REANO 的纯净输出
+        reano_encoder_outputs = self.get_encoder_output(inputs_tensor, **encoder_kwargs)
 
-        # 3. make sure that encoder returns `ModelOutput`
-        model_input_name = model_input_name if model_input_name is not None else self.main_input_name
-        encoder_kwargs["return_dict"] = True 
-        encoder_kwargs[model_input_name] = inputs_tensor
-        # model_kwargs["encoder_outputs"]: ModelOutput = encoder(**encoder_kwargs)
-        memory_input_ids = model_kwargs.get("memory_input_ids", None)
-        if memory_input_ids is not None:
-            mem_output = self.memn2n(memory_input_ids)
-            encoder_kwargs["mem_output"] = mem_output
+        # 步骤 3: 融合记忆
+        if memory_stories_ids is not None and memory_question_ids is not None:
+            # 这是“记忆车道”的处理过程
+            mem_output = self.memn2n(memory_stories_ids, memory_question_ids)
+            mem_output_expanded = mem_output.unsqueeze(1)
+            mem_attention_mask = torch.ones(mem_output_expanded.shape[:2], device=inputs_tensor.device,
+                                            dtype=torch.long)
+
+            # 从 REANO 输出中提取所需部分
+            reano_hidden_states = reano_encoder_outputs["question_ent_hidden_states"]
+            reano_attention_mask = reano_encoder_outputs["question_ent_mask"]
+
+            # 将“GNN车道”和“记忆车道”的输出拼接起来
+            final_hidden_states = torch.cat([mem_output_expanded, reano_hidden_states], dim=1)
+            final_attention_mask = torch.cat([mem_attention_mask, reano_attention_mask], dim=1)
+
+            # 将融合后的结果打包，准备送给解码器
+            # 我们需要自己构建 HuggingFace 的标准输出格式
+            model_kwargs["encoder_outputs"] = Seq2SeqLMOutput(
+                last_hidden_state=final_hidden_states
+            )
+            # HuggingFace 的 generate 函数会使用这个 attention_mask 作为 encoder_attention_mask
+            model_kwargs["attention_mask"] = final_attention_mask
         else:
-            raise ValueError("memory_input_ids is required for MemN2N integration.")
+            # 如果没有记忆，直接使用 REANO 的输出
+            model_kwargs["encoder_outputs"] = Seq2SeqLMOutput(
+                last_hidden_state=reano_encoder_outputs["question_ent_hidden_states"]
+            )
+            model_kwargs["attention_mask"] = reano_encoder_outputs["question_ent_mask"]
 
-        model_kwargs["encoder_outputs"] = self.get_encoder_output(**encoder_kwargs)
-
-        # dict_keys(['attention_mask', 'ent_indices', 'ent_mask', 'output_attentions', 'output_hidden_states', 'use_cache', 'encoder_outputs'])
         return model_kwargs
 
     def prepare_inputs_for_generation(
-        self, 
-        input_ids, 
-        attention_mask = None, 
-        question_indices = None,
-        question_mask = None, 
-        ent_indices = None, 
-        ent_mask = None,
-        entity_text=None, 
-        entity_adj=None, 
-        entity_adj_mask=None, 
-        entity_adj_relation=None, 
-        question_text=None, 
-        mask_passages=False, 
-        num_passages_after_mask=None, 
-        passage_entity_ids=None, 
-        passage_entity_mask=None, 
-        decoder_attention_mask = None, 
-        encoder_outputs = None,
-        **kwargs, 
-    ):        
+            self,
+            decoder_input_ids,
+            past=None,
+            attention_mask=None,  # 这是解码器侧的注意力，或是我们融合后的 encoder_attention_mask
+            head_mask=None,
+            decoder_head_mask=None,
+            cross_attn_head_mask=None,
+            use_cache=None,
+            encoder_outputs=None,  # 这里会接收到上面方法构建好的、已融合的 encoder_outputs
+            **kwargs,
+    ):
+        # 这个方法现在接收的是已经融合好的 encoder_outputs
+        # 所以我们可以使用标准的 T5 实现，无需改动
+        # 它会正确地将 encoder_outputs.last_hidden_state 传递给解码器的交叉注意力层
+
+        # cut decoder_input_ids if past is used
+        if past is not None:
+            decoder_input_ids = decoder_input_ids[:, -1:]
+
         return {
+            "input_ids": None,  # encoder_input_ids are not needed for the decoder
             "encoder_outputs": encoder_outputs,
-            "decoder_input_ids": input_ids, 
-            "decoder_attention_mask": decoder_attention_mask,
+            "past_key_values": past,
+            "decoder_input_ids": decoder_input_ids,
+            "attention_mask": attention_mask,
+            "head_mask": head_mask,
+            "decoder_head_mask": decoder_head_mask,
+            "cross_attn_head_mask": cross_attn_head_mask,
+            "use_cache": use_cache,
         }
