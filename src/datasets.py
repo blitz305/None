@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 class TripleFiDDataset(Dataset):
 
-    def __init__(self, data_path, n_context=None, question_prefix='question:', title_prefix='title:', passage_prefix='context:', max_num_entities=2000):
+    def __init__(self, data_path, n_context=None, question_prefix='question:', title_prefix='title:', passage_prefix='context:', max_num_entities=2000,num_pseudo_history=2):
 
         self.data = self.load_data(data_path)
         self.n_context = n_context
@@ -24,6 +24,7 @@ class TripleFiDDataset(Dataset):
         self.max_num_entities = max_num_entities
         self.sort_data()
         self.use_entityname = "entityquestion" in data_path
+        self.num_pseudo_history = num_pseudo_history
 
     def load_data(self, data_path):
         
@@ -136,11 +137,36 @@ class TripleFiDDataset(Dataset):
                 if triple not in relevant_triples:
                     relevant_triples.append(triple)
 
-        history = example.get("history", [])
+        history_turns = []
+        # 检查功能是否启用
+        if self.num_pseudo_history > 0:
+            # 创建一个不包含当前样本索引的池子
+            possible_indices = list(range(len(self.data)))
+            if index in possible_indices:
+                possible_indices.remove(index)
+
+            # 计算实际要采样的数量
+            num_to_sample = min(self.num_pseudo_history, len(possible_indices))
+
+            # 执行随机采样
+            if num_to_sample > 0:
+                history_indices = random.sample(possible_indices, num_to_sample)
+
+                # 构建伪历史
+                for hist_idx in history_indices:
+                    history_example = self.data[hist_idx]
+                    if history_example.get('answers'):
+                        history_turns.append({
+                            'q': history_example['question'],
+                            'a': history_example['answers'][0]
+                        })
+
+        # 将构建好的伪历史转换为句子列表
         story_sentences = []
-        for turn in history:
+        for turn in history_turns:
             story_sentences.append(f"question: {turn['q']} answer: {turn['a']}")
 
+        # --- 替换结束 ---
             #新增改动
         return {
             'index' : index,
@@ -156,7 +182,9 @@ class TripleFiDDataset(Dataset):
             "relevant_triples": relevant_triples,
             "evidences": example.get("evidences", None), 
             "question_entity": question_entity_list,
+            'dialogue_id': example.get('dialogue_id', f'dialogue_{index}'),  # 返回新增
             'story_sentences': story_sentences,
+            'turn_id': example.get('turn_id', 1)  #
         }
 
     def sort_data(self):
@@ -399,11 +427,12 @@ class FiDCollator(object):
 
         memory_stories_ids = torch.cat(batch_stories_ids, dim=0)
         memory_question_ids = torch.cat(batch_current_q_ids, dim=0)
+        dialogue_ids = [ex['dialogue_id'] for ex in batch]  # <-- 增加一行
 
         return (index, target_ids, target_mask, passage_ids, passage_masks, batch_question_text, batch_question_indices, batch_question_mask, \
                 batch_entity_mention_indices, batch_entity_mention_mask, batch_entity_is_answer_label, batch_entity_text, \
                     batch_entity_adj, batch_entity_adj_mask, batch_entity_adj_relation, batch_entity_adj_relevant_relation_label, \
-                        batch_passage_entity_ids, batch_passage_entity_mask,memory_stories_ids,memory_question_ids)
+                        batch_passage_entity_ids, batch_passage_entity_mask,memory_stories_ids,memory_question_ids,dialogue_ids)
 
     def maybe_truncate_question(self, question, max_num_words=100):
         words = question.split()
