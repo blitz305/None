@@ -428,11 +428,12 @@ class FiDCollator(object):
         memory_stories_ids = torch.cat(batch_stories_ids, dim=0)
         memory_question_ids = torch.cat(batch_current_q_ids, dim=0)
         dialogue_ids = [ex['dialogue_id'] for ex in batch]  # <-- 增加一行
+        turn_ids = [ex['turn_id'] for ex in batch]  # <-- 增加这一行
 
         return (index, target_ids, target_mask, passage_ids, passage_masks, batch_question_text, batch_question_indices, batch_question_mask, \
                 batch_entity_mention_indices, batch_entity_mention_mask, batch_entity_is_answer_label, batch_entity_text, \
                     batch_entity_adj, batch_entity_adj_mask, batch_entity_adj_relation, batch_entity_adj_relevant_relation_label, \
-                        batch_passage_entity_ids, batch_passage_entity_mask,memory_stories_ids,memory_question_ids,dialogue_ids)
+                        batch_passage_entity_ids, batch_passage_entity_mask,memory_stories_ids,memory_question_ids,dialogue_ids, turn_ids)
 
     def maybe_truncate_question(self, question, max_num_words=100):
         words = question.split()

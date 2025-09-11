@@ -778,7 +778,7 @@ class ReaderTrainer(BaseTrainer):
         
         (idx, labels, _, context_ids, context_mask, question_text, question_indices, question_mask, \
             ent_indices, ent_mask, ent_is_ans, entity_text, entity_adj, entity_adj_mask, \
-                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask,memory_stories_ids, memory_question_ids,dialogue_ids) = batch
+                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask,memory_stories_ids, memory_question_ids,dialogue_ids,turn_ids) = batch
         
         calculate_ans_loss = True
         calculate_kg_loss = True
@@ -814,7 +814,7 @@ class ReaderTrainer(BaseTrainer):
 
         (idx, labels, _, context_ids, context_mask, question_text, question_indices, question_mask, \
             ent_indices, ent_mask, ent_is_ans, entity_text, entity_adj, entity_adj_mask, \
-                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask, memory_stories_ids, memory_question_ids,dialogue_ids) = batch
+                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask, memory_stories_ids, memory_question_ids,dialogue_ids,turn_ids) = batch
         
         mask_passages = self.mask_passages
         num_passages_after_mask = self.num_passages_after_mask 
