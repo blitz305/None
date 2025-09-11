@@ -392,11 +392,12 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
         memory_input_ids=None,
         memory_stories_ids=None,
         memory_question_ids=None,
+        dialogue_ids=None,  #在这里接收 dialogue_ids**
             #改动
         **kwargs
     ):
 
-        calculate_kg_loss = kwargs.get("calculate_kg_loss", False)
+        calculate_kg_loss = kwargs.get("calculate_kg_loss", True)
         calculate_ans_loss = kwargs.get("calculate_ans_loss", labels is not None)
         # 只有在提供了记忆输入时才进行计算
         if memory_stories_ids is not None and memory_question_ids is not None:
@@ -499,12 +500,58 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
             ans_loss = loss_fct(lm_logits.reshape(-1, lm_logits.shape[-1]), labels.reshape(-1))
         else:
             ans_loss = None
+        # --- 在这里插入 ---
+        contrastive_loss = None
+        # 新增一个控制开关，并确保只在训练时计算
+        calculate_contrastive_loss = kwargs.get("calculate_contrastive_loss", True)
+        if calculate_contrastive_loss and dialogue_ids is not None and self.training:
+            # 取解码器输出的平均值作为句子/轮次的表示
+            embeddings = sequence_output.mean(dim=1)
+            margin = kwargs.get("contrastive_margin", 1.0)
 
-        if not calculate_kg_loss and calculate_ans_loss:
+            # 使用高效的向量化计算
+            pairwise_dist = torch.pdist(embeddings, p=2)
+
+            # 创建正负样本对的掩码
+            batch_size = embeddings.size(0)
+            # 为了处理字符串ID，先将其映射为唯一的整数ID
+            unique_ids = {d_id: i for i, d_id in enumerate(set(dialogue_ids))}
+            dialogue_ids_tensor = torch.tensor([unique_ids[d_id] for d_id in dialogue_ids], device=embeddings.device)
+            is_positive_pair = dialogue_ids_tensor.unsqueeze(1) == dialogue_ids_tensor.unsqueeze(0)
+
+            # 提取上三角部分，与 pdist 的输出顺序对应
+            triu_indices = torch.triu_indices(batch_size, batch_size, offset=1)
+            positive_mask = is_positive_pair[triu_indices[0], triu_indices[1]]
+            negative_mask = ~positive_mask
+
+            # 计算正样本对（同一对话）的损失
+            positive_loss = pairwise_dist[positive_mask].sum()
+
+            # 计算负样本对（不同对话）的损失
+            negative_loss = torch.clamp(margin - pairwise_dist[negative_mask], min=0.0).sum()
+
+            # 组合成最终的对比损失
+            num_pairs = pairwise_dist.size(0)
+            if num_pairs > 0:
+                contrastive_loss = (positive_loss + negative_loss) / num_pairs
+            else:
+                contrastive_loss = torch.tensor(0.0, device=embeddings.device)
+
+            contrastive_weight = kwargs.get("contrastive_weight", 0.1)#权重
+            contrastive_loss = contrastive_weight * contrastive_loss
+        # --- 插入结束 ---
+        # 修改后:
+        loss = None
+        if ans_loss is not None:
             loss = ans_loss
 
-        if calculate_kg_loss and calculate_ans_loss:
-            loss = kg_loss + ans_loss
+        if calculate_kg_loss and kg_loss is not None:
+            loss = kg_loss if loss is None else loss + kg_loss
+
+        # 将对比损失加入总损失
+        if calculate_contrastive_loss and contrastive_loss is not None:
+            loss = contrastive_loss if loss is None else loss + contrastive_loss
+        # --- 替换结束 ---
 
         if not return_dict:
             output = (lm_logits, question_ent_hidden_states)

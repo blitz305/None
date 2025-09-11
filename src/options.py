@@ -59,7 +59,7 @@ class Options():
         self.parser.add_argument("--init_relation_embedding", type=str, default="none", help="t5 embeddings of the rebel relations")
 
         self.parser.add_argument("--use_ent_label", action="store_true")
-        self.parser.add_argument("--alpha", type=float, default=0.1, help="weight of entity loss")
+        self.parser.add_argument("--alpha", type=float, default=0.1, help="weight of entity loss")##权重
         self.parser.add_argument("--max_n_context_for_decoder", type=int, default=None, help='maximum number of context for decoder')
         self.parser.add_argument("--num_triples", type=int, default=20, help="number of triples for the additional context")
         self.parser.add_argument("--mask_passages", action='store_true', help='whether to mask passages, only used in evaluation.')
