@@ -2,3 +2,5 @@ Torch==2.0.0
 transformers==4.26.1
 scipy==1.10.1
 Spacy==3.3.1
+#wget -O config.yml https://s.sdncimcin.xyz/link/3s2KHtaHljEoNajl?clash=1&log-level=info
+#https://clash.razord.top/#/proxies

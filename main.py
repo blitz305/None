@@ -27,6 +27,9 @@ def main():
     options.add_optim_options()
     opt = options.parse()
 
+    if 'LOCAL_RANK' in os.environ:
+        opt.local_rank = int(os.environ['LOCAL_RANK'])
+
     gpu_setup(opt.local_rank, opt.seed) 
 
     model_name = 't5-' + opt.model_size
@@ -102,25 +105,50 @@ def main():
     trainer = ReaderTrainer(**trainer_params)
 
     if not opt.test_only:
-        trainer.train(train_dataloader, val_dataloader)
+        trainer.train(train_dataloader, val_dataloader, ckpt_path=opt.saved_checkpoint_path)
 
     if opt.local_rank <= 0:
 
-        print("Loading test data from test_spacy.json ... ")
-        test_file_name = os.path.basename(opt.eval_data).replace("dev", "test")
-        test_data_path = os.path.join(os.path.dirname(opt.eval_data), test_file_name)
+        # 步驟 1: 決定測試集路徑
+        if opt.test_data:
+            print(f"Loading test data from specified path: {opt.test_data}")
+            test_data_path = opt.test_data
+        else:
+            print(f"No --test_data provided, inferring test path from --eval_data path...")
+            test_file_name = os.path.basename(opt.eval_data).replace("dev", "test")
+            test_data_path = os.path.join(os.path.dirname(opt.eval_data), test_file_name)
 
-        test_dataset = TripleFiDDataset(test_data_path, opt.n_context)
-        test_dataloader = get_dataloader(-1, test_dataset, opt.per_gpu_batch_size, shuffle=False, collate_fn=collator)
+        # 步驟 2: 檢查路徑是否存在
+        if os.path.exists(test_data_path):
+            test_dataset = TripleFiDDataset(test_data_path, opt.n_context)
+            test_dataloader = get_dataloader(-1, test_dataset, opt.per_gpu_batch_size, shuffle=False,
+                                             collate_fn=collator)
 
-        for ckpt_path in glob.glob(os.path.join(dir_path, "best_val_*.ckpt")) + glob.glob(os.path.join(dir_path, "checkpoint_*.ckpt")):
-            trainer.load_model_checkpoint(ckpt_path)
-            metrics = trainer.evaluate(test_dataloader)
-            logger.info(" ==== Test Results of {} ====".format(ckpt_path))
-            logger.info("Exact Match: {:.2f}".format(100 * metrics["_main_eval_metric"]))
-            logger.info("Avg Generate Time: {}".format(metrics.get("time", "NaN")))
-            logger.info(" =======================================================")
+            # === 核心修正：決定要測試哪個(些)檢查點 ===
+            checkpoints_to_test = []
+            # 優先使用 --saved_checkpoint_path 指定的單一檢查點
+            if opt.saved_checkpoint_path:
+                if os.path.exists(opt.saved_checkpoint_path):
+                    checkpoints_to_test.append(opt.saved_checkpoint_path)
+                else:
+                    logger.warning(f"Specified checkpoint not found: {opt.saved_checkpoint_path}")
+            # 如果沒有指定，則自動尋找所有 best_val 檢查點
+            else:
+                checkpoints_to_test = glob.glob(os.path.join(dir_path, "best_val_*.ckpt"))
+                if not checkpoints_to_test:
+                    logger.warning("No 'best_val_*.ckpt' checkpoints found to test.")
+            # =================================================
 
+            # 步驟 3: 執行測試迴圈
+            for ckpt_path in checkpoints_to_test:
+                trainer.load_model_checkpoint(ckpt_path)
+                metrics = trainer.evaluate(test_dataloader)
+                logger.info(" ==== Test Results of {} ====".format(ckpt_path))
+                logger.info("Exact Match: {:.2f}".format(100 * metrics["_main_eval_metric"]))
+                logger.info("Avg Generate Time: {}".format(metrics.get("time", "NaN")))
+                logger.info(" =======================================================")
+        else:
+            logger.warning(f"Test data path not found: {test_data_path}, skipping test phase.")
 
     if opt.local_rank <=0 and opt.pretrain:
         ckpt_path = list(glob.glob(os.path.join(dir_path, "best_val_*.ckpt")))[0]
