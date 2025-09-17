@@ -1,6 +1,7 @@
 __pycache__
 .ipynb_checkpoints/
-checkpoint/
+checkpoint/default_experiment/best_val_epoch4_step12500.ckpt
+checkpoint/default_experiment/checkpoint_epoch4_step15000.ckpt
 wandb/
 core.*
 nohup.out
