@@ -389,16 +389,19 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
         output_attentions=False,
         output_hidden_states=False,
         return_dict=False,
-        memory_input_ids=None,
         memory_stories_ids=None,
         memory_question_ids=None,
-        dialogue_ids=None,  #在这里接收 dialogue_ids**
-            #改动
+        dialogue_ids=None,
+        question_text=None,
+        calculate_ans_loss=True,
+        calculate_kg_loss=True,
+        calculate_contrastive_loss=True,
         **kwargs
     ):
 
-        calculate_kg_loss = kwargs.get("calculate_kg_loss", True)
         calculate_ans_loss = kwargs.get("calculate_ans_loss", labels is not None)
+        # 核心修改：讓KG Loss的計算也依賴於其標籤是否存在，就像ans_loss一樣
+        calculate_kg_loss = kwargs.get("calculate_kg_loss", ent_is_ans_label is not None and entity_adj_relevant_relation_label is not None)
         # 只有在提供了记忆输入时才进行计算
         if memory_stories_ids is not None and memory_question_ids is not None:
             mem_output = self.memn2n(memory_stories_ids, memory_question_ids)  # shape: [B, H]
@@ -562,53 +565,52 @@ class TripleKGFiDT5(T5ForConditionalGeneration):
 
     def _prepare_encoder_decoder_kwargs_for_generation(self, inputs_tensor: torch.Tensor, model_kwargs,
                                                        model_input_name):
-        # 步骤 1: 从 kwargs 中分离出记忆张量，避免它们被意外传递
+
+        # 導入一個更通用的容器類
+        from transformers.modeling_outputs import ModelOutput
+
+        # 步驟 1: 運行您自定義的 get_encoder_output，獲取包含所有豐富信息的字典
+        # 首先，將記憶張量從 kwargs 中分離出來，避免它們被錯誤地傳遞
         memory_stories_ids = model_kwargs.pop("memory_stories_ids", None)
         memory_question_ids = model_kwargs.pop("memory_question_ids", None)
 
-        # 步骤 2: 独立地调用 get_encoder_output 来获取 REANO 的原始输出
-        # 这是“GNN车道”的处理过程，完全不知道记忆的存在
-
-        # 准备调用 get_encoder_output 所需的参数
+        # 準備 encoder 需要的參數
         irrelevant_prefix = ["decoder_", "cross_attn", "use_cache", "encoder_outputs"]
         encoder_kwargs = {
             argument: value
             for argument, value in model_kwargs.items()
             if not any(argument.startswith(p) for p in irrelevant_prefix)
         }
+        encoder_outputs_dict = self.get_encoder_output(inputs_tensor, **encoder_kwargs)
 
-        # 调用我们的自定义 encoder，获取 REANO 的纯净输出
-        reano_encoder_outputs = self.get_encoder_output(inputs_tensor, **encoder_kwargs)
+        # 步驟 2: 執行記憶網絡融合
+        reano_hidden_states = encoder_outputs_dict["question_ent_hidden_states"]
+        reano_attention_mask = encoder_outputs_dict["question_ent_mask"]
 
-        # 步骤 3: 融合记忆
         if memory_stories_ids is not None and memory_question_ids is not None:
-            # 这是“记忆车道”的处理过程
             mem_output = self.memn2n(memory_stories_ids, memory_question_ids)
             mem_output_expanded = mem_output.unsqueeze(1)
             mem_attention_mask = torch.ones(mem_output_expanded.shape[:2], device=inputs_tensor.device,
                                             dtype=torch.long)
 
-            # 从 REANO 输出中提取所需部分
-            reano_hidden_states = reano_encoder_outputs["question_ent_hidden_states"]
-            reano_attention_mask = reano_encoder_outputs["question_ent_mask"]
-
-            # 将“GNN车道”和“记忆车道”的输出拼接起来
             final_hidden_states = torch.cat([mem_output_expanded, reano_hidden_states], dim=1)
             final_attention_mask = torch.cat([mem_attention_mask, reano_attention_mask], dim=1)
-
-            # 将融合后的结果打包，准备送给解码器
-            # 我们需要自己构建 HuggingFace 的标准输出格式
-            model_kwargs["encoder_outputs"] = Seq2SeqLMOutput(
-                last_hidden_state=final_hidden_states
-            )
-            # HuggingFace 的 generate 函数会使用这个 attention_mask 作为 encoder_attention_mask
-            model_kwargs["attention_mask"] = final_attention_mask
         else:
-            # 如果没有记忆，直接使用 REANO 的输出
-            model_kwargs["encoder_outputs"] = Seq2SeqLMOutput(
-                last_hidden_state=reano_encoder_outputs["question_ent_hidden_states"]
-            )
-            model_kwargs["attention_mask"] = reano_encoder_outputs["question_ent_mask"]
+            final_hidden_states = reano_hidden_states
+            final_attention_mask = reano_attention_mask
+
+        # 步驟 3: 創建一個能滿足所有需求的、完整的 ModelOutput 對象
+        # 首先，它包含 get_encoder_output 返回的所有原始鍵值對
+        final_encoder_outputs = ModelOutput(encoder_outputs_dict)
+
+        # 其次，我們用融合後的結果，添加或覆蓋 generate 和 forward 都需要的關鍵屬性
+        final_encoder_outputs["last_hidden_state"] = final_hidden_states  # 滿足 generate 的工人
+        final_encoder_outputs["question_ent_hidden_states"] = final_hidden_states  # 滿足您 forward 的工人
+        final_encoder_outputs["question_ent_mask"] = final_attention_mask  # 滿足您 forward 的工人
+
+        # 將這個完美的對象放回 model_kwargs
+        model_kwargs["encoder_outputs"] = final_encoder_outputs
+        model_kwargs["attention_mask"] = final_attention_mask
 
         return model_kwargs
 
