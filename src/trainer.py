@@ -21,7 +21,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from src.evaluation import ems 
-
+from transformers.modeling_outputs import BaseModelOutput
 from transformers import get_linear_schedule_with_warmup, get_constant_schedule
 
 logger = logging.getLogger(__file__)
@@ -323,7 +323,7 @@ class BaseTrainer(nn.Module):
                     shutil.rmtree(pop_peft_checkpoint_path)
 
         return self.save_val_topk_checkpoint(ckpt_name, val_score)
-                
+
     def resume_training(self, ckpt_path):
 
         logger.info(f"Rank: {self.local_rank}, Resume Training from {ckpt_path}")
@@ -339,15 +339,19 @@ class BaseTrainer(nn.Module):
         else:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self.scheduler.load_state_dict(checkpoint["scheduler"])
-        
+
         if self.use_amp and checkpoint["scaler"] is not None:
             self.amp_scaler.load_state_dict(checkpoint["scaler"])
 
-        if hasattr(self.scheduler, "last_epoch"):
-            self.scheduler.last_epoch = checkpoint["global_step"]
-        self.prev_step = checkpoint["global_step"]
-        for val_score, val_step, ckpt_name in zip(checkpoint["best_val_topk_score"], \
-            checkpoint["best_val_topk_step"], checkpoint["best_val_topk_ckpt_name"]):
+        # === 核心修正：直接恢復 global_step 和 current_epoch ===
+        self.global_step = checkpoint["global_step"]
+        self.current_epoch = checkpoint["current_epoch"]
+        # =======================================================
+
+        self.prev_step = checkpoint["global_step"]  # prev_step 仍然保留，用於日誌或其他地方
+        for val_score, val_step, ckpt_name in zip(checkpoint["best_val_topk_score"],
+                                                  checkpoint["best_val_topk_step"],
+                                                  checkpoint["best_val_topk_ckpt_name"]):
             self.best_val_topk_checkpoint.put((val_score, val_step, ckpt_name))
 
         return checkpoint
@@ -381,10 +385,10 @@ class BaseTrainer(nn.Module):
         if self.use_ddp:
             self.model = DDP(self.model, device_ids=[self.local_rank], output_device=self.local_rank)
 
-        self.optimizer, self.scheduler = self.configure_optimizer(self.model) 
+        self.optimizer, self.scheduler = self.configure_optimizer(self.model)
         if isinstance(self.optimizer, (list, tuple)):
-            assert len(self.optimizer) == len(self.scheduler) 
-        
+            assert len(self.optimizer) == len(self.scheduler)
+
         if self.use_amp:
             self.amp_scaler = torch.cuda.amp.GradScaler(enabled=True)
 
@@ -397,66 +401,75 @@ class BaseTrainer(nn.Module):
         if wandb_log:
             wandb.init(project=self.kwargs.get("wandb_project", "Default"), config=self.configs, \
                        name=self.kwargs.get("wandb_name", "default_experiment_name"))
-        
-        self.prev_step = 0 
-        self.best_val_topk_checkpoint = PriorityQueue() 
-        self.current_epoch, self.global_step = 0, 0 
-        self.max_training_steps = self.get_max_training_steps(train_dataloader)
+
+        self.prev_step = 0
+        self.best_val_topk_checkpoint = PriorityQueue()
+        self.current_epoch, self.global_step = 0, 0
 
         if ckpt_path is not None:
             checkpoint = self.resume_training(ckpt_path)
             if main_process:
                 logger.info(f"=========== Resume Training, Checkpoint info: ================")
-                logger.info(f"Previous Steps: {self.prev_step}")
+                logger.info(f"Previous Steps: {self.global_step}")  # 直接使用恢復後的 global_step
                 logger.info("Best TopK Validation Scores: {}".format(checkpoint["best_val_topk_score"]))
                 logger.info("Best TopK Valiation Steps: {}".format(checkpoint["best_val_topk_step"]))
                 logger.info("Best TopK Checkpoint Name: {}".format(checkpoint["best_val_topk_ckpt_name"]))
                 logger.info("==============================================================")
 
+        self.max_training_steps = self.get_max_training_steps(train_dataloader)
         train_start_time = time.time()
+
         while self.global_step < self.max_training_steps:
 
-            self.current_epoch += 1 
+            self.current_epoch += 1
 
             self.training_epoch_start(train_dataloader)
 
             logger.info(f"Rank: {self.local_rank}, Epoch: {self.current_epoch} Training ... ")
             if self.use_ddp:
-                train_dataloader.sampler.set_epoch(self.current_epoch) 
-                dist.barrier() 
-            
-            num_update_step_per_epoch = len(train_dataloader) // self.accumulate_grad_batches
-            num_batch_per_epoch = num_update_step_per_epoch * self.accumulate_grad_batches
-            if self.current_epoch == 1:
-                logger.info(f"Rank: {self.local_rank}, number of batches in the dataloader: {len(train_dataloader)}, number of batches used in an epoch: {num_batch_per_epoch}")
-            
-            for batch_idx, batch in enumerate(train_dataloader):
+                train_dataloader.sampler.set_epoch(self.current_epoch)
+                dist.barrier()
+
+                # === 核心修正：創建一個 iterator 並跳過已訓練的批次 ===
+            num_update_steps_per_epoch = len(train_dataloader) // self.accumulate_grad_batches
+            num_batch_per_epoch = num_update_steps_per_epoch * self.accumulate_grad_batches
+
+            # 計算在當前 epoch 中應該從哪個 batch_idx 開始
+            start_batch_idx = self.global_step % num_batch_per_epoch
+
+            train_iterator = iter(train_dataloader)
+            # 跳過已經處理過的 batch
+            if start_batch_idx > 0:
+                logger.info(f"Rank: {self.local_rank}, Skipping first {start_batch_idx} batches...")
+                for _ in range(start_batch_idx):
+                    next(train_iterator)
+            # ========================================================
+
+            if self.current_epoch == 1 and start_batch_idx == 0:
+                logger.info(
+                    f"Rank: {self.local_rank}, number of batches in the dataloader: {len(train_dataloader)}, number of batches used in an epoch: {num_batch_per_epoch}")
+
+            # === 核心修正：使用 iterator 進行迴圈 ===
+            for batch_idx, batch in enumerate(train_iterator, start=start_batch_idx):
 
                 if batch_idx >= num_batch_per_epoch:
                     break
-
-                if self.global_step < self.prev_step:
-                    if (batch_idx + 1) % self.accumulate_grad_batches == 0:
-                        self.global_step += 1 
-                        if val_dataloader is not None and self.global_step % self.val_every_n_steps == 0:
-                            for _ in val_dataloader:
-                                break
-                    continue
+                # ===========================================
 
                 self.model.train()
-                if batch_idx % self.accumulate_grad_batches == 0: 
+                if batch_idx % self.accumulate_grad_batches == 0:
 
                     optimizer_list = self.optimizer if isinstance(self.optimizer, (tuple, list)) else [self.optimizer]
                     for opt in optimizer_list:
                         opt.zero_grad()
 
                     step_start_time = time.time()
-                    loss_per_update_step = 0.0 
+                    loss_per_update_step = 0.0
                     self.log_variable_per_update_step = defaultdict(float)
                     self.log_tensor = {}
 
                     self.training_step_start()
-                
+
                 batch = self.setup_batch(batch)
                 unwrap_model = self.model.module if self.use_ddp else self.model
 
@@ -469,38 +482,39 @@ class BaseTrainer(nn.Module):
                     else:
                         batch_outputs = self.training_step(unwrap_model, batch)
                     if not isinstance(batch_outputs, (tuple, list)):
-                        batch_outputs = (batch_outputs, )
+                        batch_outputs = (batch_outputs,)
                     batch_loss = batch_outputs[0] / (self.accumulate_grad_batches * self.world_size)
                     if self.use_amp:
-                        assert batch_loss.dtype == torch.float32 
+                        assert batch_loss.dtype == torch.float32
                         self.amp_scaler.scale(batch_loss).backward()
                     else:
                         batch_loss.backward()
                 if self.use_ddp and (batch_idx + 1) % self.accumulate_grad_batches == 0:
                     for param in self.model.parameters():
-                        if param.grad is not None: 
+                        if param.grad is not None:
                             dist.all_reduce(param.grad.data, op=dist.ReduceOp.SUM)
                     dist.barrier()
                 batch_loss = self.sum_main(batch_loss, main_process, self.use_ddp)
                 loss_per_update_step += batch_loss.item()
-                
+
                 for log_n, log_t in self.log_tensor.items():
                     log_t = log_t / (self.accumulate_grad_batches * self.world_size)
                     log_t = self.sum_main(log_t, main_process, self.use_ddp)
                     self.log_variable_per_update_step[log_n] += log_t.item()
-                
+
                 if (batch_idx + 1) % self.accumulate_grad_batches == 0:
                     if self.use_amp:
                         for opt in (self.optimizer if isinstance(self.optimizer, (list, tuple)) else [self.optimizer]):
                             self.amp_scaler.unscale_(opt)
-                    # gradient clipping 
+
                     if self.gradient_clip_val > 0:
                         nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_val)
-                    
+
                     grad_status = self.compute_grad_status(grad_all_reduced=True)
                     if grad_status["has_inf_nan"]:
-                        logger.info("Rank: {}, Detected Inf or NaN gradient at: {}. Skip gradient update at global step {}.".format(\
-                            self.local_rank, grad_status["params_first_with_inf_nan"], self.global_step+1))
+                        logger.info(
+                            "Rank: {}, Detected Inf or NaN gradient at: {}. Skip gradient update at global step {}.".format( \
+                                self.local_rank, grad_status["params_first_with_inf_nan"], self.global_step + 1))
                         if self.use_amp:
                             self.amp_scaler.update()
                         for opt in (self.optimizer if isinstance(self.optimizer, (tuple, list)) else [self.optimizer]):
@@ -508,71 +522,75 @@ class BaseTrainer(nn.Module):
                     else:
                         self.optimizer_step(self.optimizer, self.scheduler)
 
-                    self.global_step += 1 
+                    self.global_step += 1
                     if wandb_log:
-                        wandb.log({"loss":loss_per_update_step, "grad_min": grad_status["grad_min"], "grad_max": grad_status["grad_max"], \
-                                   "grad_mean": grad_status["grad_mean"], "time (s)": time.time()-step_start_time, \
+                        wandb.log({"loss": loss_per_update_step, "grad_min": grad_status["grad_min"],
+                                   "grad_max": grad_status["grad_max"], \
+                                   "grad_mean": grad_status["grad_mean"], "time (s)": time.time() - step_start_time, \
                                    **self.log_variable_per_update_step}, step=self.global_step)
                     if main_process and self.global_step % self.log_every_n_steps == 0:
                         current_time = time.time()
                         one_step_time = current_time - step_start_time
-                        trained_time = self.get_time_format(current_time-train_start_time)
-                        estimated_time = self.get_time_format(one_step_time*(self.max_training_steps-self.global_step))
-                        training_info = "Rank: {}, Epoch: {}, Step: {}/{}, loss: {:.5f}, grad_min: {:.5f}, grad_max: {:.5f}, grad_mean(%): {:.5f}, ".format(\
-                            self.local_rank, self.current_epoch, self.global_step, self.max_training_steps, loss_per_update_step,\
-                                grad_status["grad_min"], grad_status["grad_max"], 100*grad_status["grad_mean"])
+                        trained_time = self.get_time_format(current_time - train_start_time)
+                        estimated_time = self.get_time_format(
+                            one_step_time * (self.max_training_steps - self.global_step))
+                        training_info = "Rank: {}, Epoch: {}, Step: {}/{}, loss: {:.5f}, grad_min: {:.5f}, grad_max: {:.5f}, grad_mean(%): {:.5f}, ".format( \
+                            self.local_rank, self.current_epoch, self.global_step, self.max_training_steps,
+                            loss_per_update_step, \
+                            grad_status["grad_min"], grad_status["grad_max"], 100 * grad_status["grad_mean"])
                         for log_n, log_v in self.log_variable_per_update_step.items():
                             training_info += "{}: {:.5f}, ".format(log_n, log_v)
                         training_info += "time: {}/{}".format(trained_time, estimated_time)
                         logger.info(training_info)
-                    
+
                     self.training_step_end()
 
-                    # evaluate
                     if val_dataloader is not None and self.global_step % self.val_every_n_steps == 0:
-                        val_metric_dict = self.evaluate(val_dataloader, main_process) 
+                        val_metric_dict = self.evaluate(val_dataloader, main_process)
                         if main_process:
                             val_metric = val_metric_dict.pop("_main_eval_metric")
 
-                            val_info = "Rank: {}, Epoch: {}, Step: {}, Evaluation Score: {:.5f}".format(self.local_rank, self.current_epoch, self.global_step, val_metric)
+                            val_info = "Rank: {}, Epoch: {}, Step: {}, Evaluation Score: {:.5f}".format(self.local_rank,
+                                                                                                        self.current_epoch,
+                                                                                                        self.global_step,
+                                                                                                        val_metric)
                             for val_k, val_v in val_metric_dict.items():
                                 val_info += ", {}: {:.5f}".format(val_k, val_v)
                             logger.info(val_info)
-                            
-                            ckpt_name = "best_val_epoch{}_step{}.ckpt".format(self.current_epoch, self.global_step)
-                            self.best_val_topk_handler(ckpt_name, val_metric) 
 
-                            # logging 
+                            ckpt_name = "best_val_epoch{}_step{}.ckpt".format(self.current_epoch, self.global_step)
+                            self.best_val_topk_handler(ckpt_name, val_metric)
+
                             if wandb_log:
                                 wandb.log(
                                     {
-                                        "val_metric": val_metric, 
+                                        "val_metric": val_metric,
                                         "best_val_metric": self.best_val_topk_checkpoint.queue[-1][0],
                                         "best_val_step": self.best_val_topk_checkpoint.queue[-1][1],
                                         **val_metric_dict,
                                     }
                                 )
-                    
+
                     if self.use_ddp:
                         dist.barrier()
 
                     if main_process and self.save_checkpoint_every_n_steps > 0 and \
-                        self.global_step % self.save_checkpoint_every_n_steps == 0:
-                        ckpt_path = "{}/checkpoint_epoch{}_step{}.ckpt".format(\
+                            self.global_step % self.save_checkpoint_every_n_steps == 0:
+                        ckpt_path = "{}/checkpoint_epoch{}_step{}.ckpt".format( \
                             self.default_root_dir, self.current_epoch, self.global_step)
                         self.save_model_checkpoint(ckpt_path)
-                    
+
                     if self.use_ddp:
                         dist.barrier()
 
-                    # stop training 
                     if self.global_step >= self.max_training_steps:
-                        logger.info(f"Rank: {self.local_rank}, Reach maximum steps {self.max_training_steps}, Stopping ... ")
+                        logger.info(
+                            f"Rank: {self.local_rank}, Reach maximum steps {self.max_training_steps}, Stopping ... ")
                         break
 
             self.training_epoch_end(train_dataloader)
 
-        total_train_time = self.get_time_format(time.time()-train_start_time)
+        total_train_time = self.get_time_format(time.time() - train_start_time)
         logger.info(f"Rank: {self.local_rank}, Total Training Time: {total_train_time}")
         
     def evaluate(self, dataloader, main_process=True):
@@ -778,7 +796,7 @@ class ReaderTrainer(BaseTrainer):
         
         (idx, labels, _, context_ids, context_mask, question_text, question_indices, question_mask, \
             ent_indices, ent_mask, ent_is_ans, entity_text, entity_adj, entity_adj_mask, \
-                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask) = batch
+                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask,memory_stories_ids, memory_question_ids,dialogue_ids,turn_ids) = batch
         
         calculate_ans_loss = True
         calculate_kg_loss = True
@@ -799,22 +817,27 @@ class ReaderTrainer(BaseTrainer):
             ent_is_ans_label=ent_is_ans,
             calculate_ans_loss=calculate_ans_loss,
             calculate_kg_loss=calculate_kg_loss,
-            question_text=question_text, 
+            question_text=question_text,
+            memory_stories_ids=memory_stories_ids,
+            memory_question_ids=memory_question_ids,
+            dialogue_ids=dialogue_ids,  # <-- 增加传递
+            calculate_contrastive_loss=True
         )[0]
 
         return train_loss
-    
+
     def evaluate_step(self, model, batch, dataloader):
 
-        dataset = dataloader.dataset 
+        dataset = dataloader.dataset
 
         (idx, labels, _, context_ids, context_mask, question_text, question_indices, question_mask, \
-            ent_indices, ent_mask, ent_is_ans, entity_text, entity_adj, entity_adj_mask, \
-                entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask) = batch
-        
+         ent_indices, ent_mask, ent_is_ans, entity_text, entity_adj, entity_adj_mask, \
+         entity_adj_relation, entity_adj_relevant_relation_label, passage_entity_ids, passage_entity_mask,
+         memory_stories_ids, memory_question_ids, dialogue_ids, turn_ids) = batch
+
         mask_passages = self.mask_passages
-        num_passages_after_mask = self.num_passages_after_mask 
-        
+        num_passages_after_mask = self.num_passages_after_mask
+
         outputs = model.generate(
             input_ids=context_ids,
             attention_mask=context_mask,
@@ -822,16 +845,18 @@ class ReaderTrainer(BaseTrainer):
             question_mask=question_mask,
             ent_indices=ent_indices,
             ent_mask=ent_mask,
-            entity_text=entity_text, 
-            entity_adj=entity_adj, 
-            entity_adj_mask=entity_adj_mask, 
-            entity_adj_relation=entity_adj_relation, 
+            entity_text=entity_text,
+            entity_adj=entity_adj,
+            entity_adj_mask=entity_adj_mask,
+            entity_adj_relation=entity_adj_relation,
             max_length=50,
-            question_text=question_text, 
-            mask_passages = mask_passages, 
-            num_passages_after_mask = num_passages_after_mask, 
-            passage_entity_ids = passage_entity_ids, 
-            passage_entity_mask = passage_entity_mask
+            question_text=question_text,
+            mask_passages=mask_passages,
+            num_passages_after_mask=num_passages_after_mask,
+            passage_entity_ids=passage_entity_ids,
+            passage_entity_mask=passage_entity_mask,
+            memory_stories_ids=memory_stories_ids,
+            memory_question_ids=memory_question_ids
         )
 
         score_list = []
