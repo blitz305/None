@@ -1,0 +1,53 @@
+
+            accumulation_steps: 16                                      	(default: 1)
+                         alpha: 0.1                                     
+              answer_maxlength: -1                                      
+                checkpoint_dir: checkpoint                              	(default: ./checkpoint/)
+                          clip: 1.0                                     
+                       dropout: 0.1                                     
+                       ent_dim: 128                                     
+                     eval_data: /root/data/dev_with_relevant_triples_wounkrel.pkl	(default: none)
+                     eval_freq: 500                                     
+               eval_print_freq: 1000                                    
+                      fixed_lr: False                                   
+                           hop: 3                                       	(default: 2)
+       init_relation_embedding: /root/data/relation_t5base_embeddings.pkl	(default: none)
+                             k: 20                                      	(default: 5)
+                    local_rank: 0                                       	(default: -1)
+                            lr: 0.0001                                  
+                     main_port: -1                                      
+                 mask_passages: False                                   
+     max_n_context_for_decoder: None                                    
+                       maxload: -1                                      
+                   memory_size: 20                                      
+                    model_path: none                                    
+                    model_size: base                                    
+                     n_context: 10                                      	(default: 1)
+                          name: default_experiment                      	(default: experiment_name)
+                      no_title: False                                   
+       num_passages_after_mask: 10                                      
+                   num_triples: 20                                      
+                         optim: adam                                    
+            per_gpu_batch_size: 2                                       	(default: 1)
+                      pretrain: False                                   
+                   relation2id: /root/data/relation2id.pkl              	(default: none)
+               relationid2name: /root/data/relationid2name.pkl          	(default: none)
+                     save_freq: 15000                                   	(default: 5000)
+         saved_checkpoint_path: checkpoint/default_experiment/checkpoint_epoch4_step15000.ckpt	(default: None)
+                     scheduler: fixed                                   
+               scheduler_steps: None                                    
+                          seed: 0                                       
+                 sentence_size: 64                                      
+                     test_data: /root/data/test_with_relevant_triples_wounkrel.pkl	(default: None)
+                     test_only: True                                    	(default: False)
+                text_maxlength: 250                                     
+                   total_steps: 15000                                   	(default: 1000)
+                    train_data: /root/data/train_with_relevant_triples_wounkrel.pkl	(default: none)
+                use_checkpoint: False                                   
+                 use_ent_label: False                                   
+                     use_wandb: False                                   
+                    wandb_name: default_run                             
+                 wandb_project: FiD                                     
+                  warmup_steps: 1000                                    
+                  weight_decay: 0.01                                    	(default: 0.1)
+
