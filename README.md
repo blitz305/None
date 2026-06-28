@@ -1,70 +1,109 @@
-# REANO: Optimising Retrieval-Augmented Reader Models through Knowledge Graph Generation 
+# Conv-REANO: Adapting Knowledge-Augmented Readers for Conversational QA with Memory Networks and Contrastive Learning
 
-This repository contains the PyTorch implementation of our REANO framework. Details about REANO can be found in our [paper](https://aclanthology.org/2024.acl-long.115/).
+This repository contains the PyTorch implementation of **Conv-REANO**, a conversational extension of the REANO framework for retrieval-augmented open-domain question answering.
 
-## Introduction 
-Open domain question answering (ODQA) aims to answer questions with knowledge from an external corpus. Fusion-in-Decoder (FiD) is an effective retrieval-augmented reader model to address this task. Given that FiD independently encodes passages, which overlooks the semantic relationships between passages, some studies use knowledge graphs (KGs) to establish dependencies among passages. However, they only leverage knowledge triples from existing KGs, which suffer from incompleteness and may lack certain information critical for answering given questions. To this end, in order to capture the dependencies between passages while tacking the issue of incompleteness in existing KGs, we propose to enhance the retrieval017 augmented reader model with a knowledge graph generation module (REANO). Specifically, REANO consists of a KG generator and an answer predictor. The KG generator aims to generate KGs from the passages and the answer predictor then generates answers based on the passages and the generated KGs.
+REANO dynamically constructs knowledge graphs from retrieved passages and uses graph reasoning to support answer generation. However, the original REANO reader is mainly designed for single-turn questions and does not explicitly model dialogue history. This limits its applicability to conversational question answering, where the current question may depend on previous turns through coreference, ellipsis, or other context-dependent expressions.
+
+Conv-REANO addresses this limitation by adding a conversational context stream to the REANO reader. The model introduces:
+
+- an end-to-end memory network (MemN2N) to encode and retrieve useful information from dialogue history;
+- a contrastive learning objective to encourage more structured dialogue-aware turn representations;
+- a late-fusion decoder input that combines REANO factual representations with the memory-based conversational context representation.
+
+## Overview
+
+Conv-REANO keeps the original REANO factual reasoning pipeline and extends it with a lightweight conversational module.
+
+The factual knowledge stream follows REANO: retrieved passages are encoded, entities and relations are used to construct a dynamic knowledge graph, and graph reasoning is applied to select answer-relevant triples. These triples are converted into textual knowledge and fused with the passage representations for generation.
+
+The conversational context stream uses MemN2N to represent pseudo-history or dialogue history as memory slots. Given the current question, the memory network attends to these slots and produces a compact context vector. This vector is concatenated with the REANO factual hidden states before decoding.
 
 <figure style="text-align: center;">
-  <img src="figures/reano.png" alt="model">
-  <figcaption>Overview of REANO.</figcaption>
+  <img src="figures/conv_reano.png" alt="Conv-REANO model">
+  <figcaption>Overall architecture of Conv-REANO.</figcaption>
 </figure>
 
-## Preprocessing 
+## Repository Structure
 
-In the preprocessing step, we generate KG triples for the retrieved documents following these steps: 
-
-### 1. Download Data 
-For the NQ and TQA datasets, we use the data from the Fusion-in-Decoder repository [here](https://github.com/facebookresearch/FiD). For the other three datasets used in our experiments, we download them from their official websites: [EntityQuestions](https://github.com/princeton-nlp/EntityQuestions), [2WikiMultiHopQA](https://github.com/Alab-NII/2wikimultihop), [MuSiQue](https://github.com/StonyBrookNLP/musique). 
-
-After downloading the data, we use Spacy NER tool and TAGME entity linking tool to identify the entities within the passages. Additionally, we also extract the KG triples between these entities from Wikidata. The processed data `*_with_triples.pkl` can be downloaded from the `qa_data` folder at [here](https://osf.io/58a3t/). 
-
-### 2. Relation Extraction
-
-In REANO, we train a DocuNet model on the REBEL dataset for intra-context relation extraction. To extract relations among entities within a passage, first download the relation information from the `rebel_data` folder at [here](https://osf.io/wn2q7/). Then download the DocuNet checkpoint from the `checkpoints` folder at the website. 
-
-Run the following command to obtain intra-context relations:
+```text
+.
+├── checkpoint/
+│   └── default_experiment/
+├── figures/
+│   └── conv_reano.png
+├── relation_extraction/
+│   └── scripts and utilities for relation extraction
+├── src/
+│   ├── fid.py
+│   ├── mem2n.py
+│   └── model components
+├── main.py
+├── task.sh
+├── requirements.txt
+└── README.md
 ```
-python -m relation_extraction.docunet_inference \
-    --relation2id /path/to/rebel_data/folder/relation2id.pkl \
-    --docunet_checkpoint /path/to/DocuNet/checkpoint/folder/docunet.ckpt \
-    --data_folder data/2wikimultihopqa
+
+## Preprocessing
+
+Conv-REANO uses the same preprocessing pipeline as the original REANO repository. Please follow the preprocessing instructions in the REANO README to prepare entity annotations, relation triples, and graph-related files.
+
+The training and evaluation scripts expect processed files such as:
+
+- `*_with_relevant_triples_wounkrel.pkl`
+- `relation2id.pkl`
+- `relationid2name.pkl`
+- `relation_t5base_embeddings.pkl`
+
+For the experiments in this repository, 2WikiMultiHopQA is used as the base dataset. Since it is not a native conversational QA dataset, the current implementation constructs pseudo-history from sampled question-answer pairs and feeds it to the memory network.
+
+## Running
+
+Install dependencies:
+
+```bash
+pip install -r requirements.txt
 ```
-The `data_folder` is the folder where you put the `*_with_triples.pkl` files. Note that the DocuNet model requires specific versions of PyTorch and transformers to work, so you may need to follow the requirements in the `relation_extraction` folder to instantiate a new environment. The generated triples can be downloaded at [here](https://osf.io/58a3t/).
 
-### 3. Prepare Data for Training and Evaluation 
+Run the default script:
 
-After relation extraction, we can obtain files `*_with_pred_triples.pkl` that store the intra-context triples. Next, we need to merge these files with the Wikidata triples as follows:
+```bash
+bash task.sh
 ```
-python -m relation_extraction.merge_triples \
-    --datafolder data/2wikimultihopqa/
-```
-The `data_folder` is the folder where you put the `*_with_triples.pkl` files as well as the `*_with_pred_triples.pkl` files. 
 
-Note that the above preprocessing can take some time. You can directly download the preprocessed files `*_with_relevant_triples_wounkrel.pkl` from the `qa_data` folder at [here](https://osf.io/wn2q7/).
+The current `task.sh` is configured for evaluation because it includes `--test_only` and `--saved_checkpoint_path`. Before running, update the paths in `task.sh` to match your local data and checkpoint locations:
 
-## Training and Evaluation 
-Run the following script to train and evaluate REANO: 
-```
-bash task.sh 
-``` 
-This script will train and then evaluate the REANO model based on the provided data. 
+- `--train_data`
+- `--eval_data`
+- `--test_data`
+- `--relation2id`
+- `--relationid2name`
+- `--init_relation_embedding`
+- `--saved_checkpoint_path`
+- `--checkpoint_dir`
 
-You can download the trained checkpoints for different datasets from the `checkpoints` folder at [here](https://osf.io/wn2q7/). If you only wish to evaluate the model's performance, download the corresponding checkpoint and change the `--checkpoint` and `--name` parameters to specifiy the location of the checkpoint. Additionally, include the `--test_only` hyperparameter to perform evaluation without training.
+To train from scratch or continue training, remove `--test_only` and adjust `--saved_checkpoint_path` as needed.
 
-## Citation 
-If you find our paper and the resources useful, please kindly cite our paper:
-```
-@inproceedings{
-    author={Jinyuan Fang and Zaiqiao Meng and Craig Macdonald},
-    title={REANO: Optimising Retrieval-Augmented Reader Models through Knowledge Graph Generation}, 
-    booktitle = {Proceedings of the 62nd Annual Meeting of the Association for Computational Linguistics},
-    year={2024},
-}
-```
-## Acknowledgements 
-Our code is built upon the Fusion-in-Decoder and DocuNet repositories. We thank the authors of these projects for making their code publicly available!
+Useful Conv-REANO-specific arguments include:
 
-## Contact 
+- `--memory_size`: number of memory slots used for pseudo-history;
+- `--sentence_size`: maximum token length of each memory sentence.
 
-If you have any questions about the code, feel free to contact me via fangjy6@gmail.com. 
+## Implementation Notes
+
+The main changes relative to REANO are:
+
+- `src/mem2n.py`: implements the end-to-end memory network;
+- `src/fid.py`: integrates MemN2N with the REANO reader, fuses memory output with factual hidden states before decoding, and adds the contrastive learning objective;
+- `src/datasets.py`: builds memory inputs for pseudo-history and provides dialogue identifiers used by the contrastive loss.
+
+The current implementation is intended as an exploratory conversational extension of REANO. For native conversational QA datasets, the pseudo-history construction should be replaced with real dialogue history.
+
+## Acknowledgements
+
+This repository is built upon the original REANO implementation, which itself is based on Fusion-in-Decoder and DocuNet. We thank the authors of REANO, FiD, and DocuNet for making their code and resources publicly available.
+
+## Contact
+
+For questions about this repository, please contact:
+
+3230060019@i.smu.edu.cn
